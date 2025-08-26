@@ -11,12 +11,21 @@ import time
 import os
 import platform
 import logging
+from contextlib import contextmanager
 
 app = FastAPI()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Global error state tracking for CUDA failures
+cuda_error_state = {
+    "has_cuda_error": False,
+    "last_error_time": None,
+    "error_count": 0,
+    "last_error_message": None
+}
 
 # Initialize TTS model with all optimizations enabled
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -95,6 +104,42 @@ def get_preset_settings(preset):
     
     return settings
 
+@contextmanager
+def cuda_error_recovery():
+    """
+    Context manager to handle CUDA errors and track recovery failures.
+    When a CUDA error occurs and recovery fails, it updates the global error state.
+    """
+    global cuda_error_state
+    try:
+        yield
+    except Exception as e:
+        # Check if this is a CUDA-related error
+        error_str = str(e).lower()
+        if 'cuda' in error_str or 'gpu' in error_str or torch.cuda.is_available():
+            try:
+                # Attempt CUDA recovery
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                logger.info("CUDA recovery attempted")
+                # If we get here, recovery might have worked, but we still re-raise the original exception
+                raise e
+            except Exception as recovery_error:
+                # Recovery failed - update error state
+                cuda_error_state["has_cuda_error"] = True
+                cuda_error_state["last_error_time"] = time.time()
+                cuda_error_state["error_count"] += 1
+                cuda_error_state["last_error_message"] = str(e)
+                logger.error(f"CUDA error recovery failed: {recovery_error}")
+                raise HTTPException(
+                    status_code=503, 
+                    detail="CUDA error occurred and recovery failed. Please restart the service."
+                )
+        else:
+            # Non-CUDA error, just re-raise
+            raise e
+
 @app.post("/synthesize")
 async def synthesize(payload: SynthesizePayload):
     try:
@@ -113,14 +158,15 @@ async def synthesize(payload: SynthesizePayload):
             logger.error(f"Voice loading failed: {e}")
             raise HTTPException(status_code=400, detail=str(e))
         
-        audio_generator = tts.tts_stream(
-            payload.text,
-            voice_samples=voice_samples,
-            **get_preset_settings(payload.preset)
-        )
-        
-        # Get the first (and only) audio chunk from the generator
-        pcm_audio = next(audio_generator)
+        with cuda_error_recovery():
+            audio_generator = tts.tts_stream(
+                payload.text,
+                voice_samples=voice_samples,
+                **get_preset_settings(payload.preset)
+            )
+            
+            # Get the first (and only) audio chunk from the generator
+            pcm_audio = next(audio_generator)
         
         # Record generation time
         generation_time = time.time() - start_time
@@ -192,31 +238,32 @@ async def synthesize_stream(payload: SynthesizePayload):
                 logger.error(f"Voice loading failed in streaming: {e}")
                 raise HTTPException(status_code=400, detail=str(e))
             
-            audio_generator = tts.tts_stream(
-                payload.text,
-                voice_samples=voice_samples,
-                **get_preset_settings(payload.preset)
-            )
-            
-            for audio_chunk in audio_generator:
-                if isinstance(audio_chunk, torch.Tensor):
-                    audio_data = audio_chunk.cpu().numpy()
-                else:
-                    audio_data = audio_chunk
+            with cuda_error_recovery():
+                audio_generator = tts.tts_stream(
+                    payload.text,
+                    voice_samples=voice_samples,
+                    **get_preset_settings(payload.preset)
+                )
                 
-                # Handle multi-dimensional audio data
-                if len(audio_data.shape) > 1:
-                    audio_data = audio_data[0] if audio_data.shape[0] == 1 else audio_data.flatten()
-                
-                # Normalize audio to 16-bit PCM range
-                audio_data = np.clip(audio_data, -1.0, 1.0)
-                audio_data = (audio_data * 32767).astype(np.int16)
-                
-                # Convert to WAV format
-                bio = io.BytesIO()
-                wavfile.write(bio, 24000, audio_data)
-                bio.seek(0)
-                yield bio.read()
+                for audio_chunk in audio_generator:
+                    if isinstance(audio_chunk, torch.Tensor):
+                        audio_data = audio_chunk.cpu().numpy()
+                    else:
+                        audio_data = audio_chunk
+                    
+                    # Handle multi-dimensional audio data
+                    if len(audio_data.shape) > 1:
+                        audio_data = audio_data[0] if audio_data.shape[0] == 1 else audio_data.flatten()
+                    
+                    # Normalize audio to 16-bit PCM range
+                    audio_data = np.clip(audio_data, -1.0, 1.0)
+                    audio_data = (audio_data * 32767).astype(np.int16)
+                    
+                    # Convert to WAV format
+                    bio = io.BytesIO()
+                    wavfile.write(bio, 24000, audio_data)
+                    bio.seek(0)
+                    yield bio.read()
         
         return StreamingResponse(generate_audio(), media_type="audio/wav")
     except Exception as e:
@@ -236,6 +283,48 @@ async def health_check():
             "autoregressive_batch_size": 16
         }
     }
+
+@app.get("/health/cuda")
+async def cuda_health_check():
+    """
+    CUDA-specific health check endpoint to detect CUDA error recovery failures.
+    Returns 503 status when CUDA errors have occurred and recovery failed.
+    This endpoint is designed for container restart detection.
+    """
+    global cuda_error_state
+    
+    if cuda_error_state["has_cuda_error"]:
+        # Calculate time since last error
+        time_since_error = time.time() - cuda_error_state["last_error_time"] if cuda_error_state["last_error_time"] else 0
+        
+        # Return unhealthy status with error details
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "unhealthy",
+                "reason": "CUDA error recovery failed",
+                "error_count": cuda_error_state["error_count"],
+                "last_error_message": cuda_error_state["last_error_message"],
+                "time_since_error_seconds": time_since_error,
+                "recommendation": "Container restart required"
+            }
+        )
+    
+    # Return healthy status with CUDA info
+    cuda_info = {
+        "status": "healthy",
+        "cuda_available": torch.cuda.is_available(),
+        "error_count": cuda_error_state["error_count"]
+    }
+    
+    if torch.cuda.is_available():
+        cuda_info.update({
+            "device_name": torch.cuda.get_device_name(0),
+            "memory_allocated": torch.cuda.memory_allocated(0),
+            "memory_reserved": torch.cuda.memory_reserved(0)
+        })
+    
+    return cuda_info
 
 @app.get("/voices")
 async def list_voices():
