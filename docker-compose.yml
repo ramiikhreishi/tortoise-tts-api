@@ -13,6 +13,7 @@ services:
       - /mnt/user/data/tortoise_tts/models:/models
       - /mnt/user/data/tortoise_tts/results:/results
       - /mnt/user/data/.cache/huggingface:/root/.cache/huggingface
+      - /mnt/user/data/tortoise_tts/logs:/app/logs
       - /root:/work
     deploy:
       resources:

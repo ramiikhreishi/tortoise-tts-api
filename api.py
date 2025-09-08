@@ -11,13 +11,41 @@ import time
 import os
 import platform
 import logging
+import asyncio
+import threading
 from contextlib import contextmanager
+from functools import lru_cache
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
 
 app = FastAPI()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+
+# Create logs directory if it doesn't exist
+log_dir = Path(os.environ.get('LOG_DIR', ''))
+log_dir.mkdir(exist_ok=True)
+
+# Configure logging with both file and console output
+file_handler = RotatingFileHandler(
+    log_dir / 'tortoise_tts_api.log',
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        file_handler,
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
+
+# Global concurrency control - serialize GPU access
+gpu_semaphore = asyncio.Semaphore(1)  # serialize GPU use; raise to 2 only if stable
+gpu_lock = threading.Lock()  # for synchronous operations in streaming
 
 # Global error state tracking for CUDA failures
 cuda_error_state = {
@@ -27,7 +55,7 @@ cuda_error_state = {
     "last_error_message": None
 }
 
-# Initialize TTS model with all optimizations enabled
+# Initialize TTS model with conservative settings for stability
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using device: {device}")
 
@@ -38,14 +66,48 @@ use_deepspeed = is_linux and torch.cuda.is_available()
 print(f"Platform: {platform.system()}")
 print(f"DeepSpeed: {'Enabled' if use_deepspeed else 'Disabled'}")
 
-# Enable all performance optimizations
+# Conservative settings for production stability
 tts = TextToSpeech(
     use_deepspeed=use_deepspeed,   # Enable on Linux, disable on Windows
     kv_cache=True,                 # 5x faster according to changelog  
     half=True,                     # Half precision for speed and memory
-    autoregressive_batch_size=16,  # Optimal for RTX 4060
+    autoregressive_batch_size=4,   # Reduced from 16 to 4 for stability
     device=device
 )
+
+# Voice sample caching to avoid repeated file I/O
+@lru_cache(maxsize=64)
+def _cached_voice_samples(voice_name: str):
+    """Cache voice samples to avoid repeated file I/O and reduce race conditions."""
+    if voice_name == "random":
+        return None
+    
+    logger.info(f"Loading voice samples for '{voice_name}' (cache miss)")
+    try:
+        voice_samples = load_voice_samples(voice_name)
+        if not voice_samples:
+            logger.error(f"load_voice_samples returned empty list for '{voice_name}'")
+            raise ValueError(f"No voice samples loaded for '{voice_name}'")
+        logger.info(f"Successfully cached {len(voice_samples)} voice samples for '{voice_name}'")
+        return voice_samples
+    except Exception as e:
+        logger.error(f"Failed to load voice samples for '{voice_name}': {e}")
+        raise
+
+def clear_voice_cache():
+    """Clear the voice samples cache. Useful for debugging voice loading issues."""
+    _cached_voice_samples.cache_clear()
+    logger.info("Voice samples cache cleared")
+
+def ensure_vram(min_free_bytes=1_000_000_000):  # ~1 GB
+    """Check if there's enough VRAM headroom before starting inference."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        total = torch.cuda.get_device_properties(0).total_memory
+        reserved = torch.cuda.memory_reserved(0)
+        free = total - reserved
+        return free >= min_free_bytes
+    return True
 
 class SynthesizePayload(BaseModel):
     text: str
@@ -55,6 +117,7 @@ class SynthesizePayload(BaseModel):
 def get_preset_settings(preset):
     """
     Returns the settings for a given preset, compatible with tts_stream method.
+    Conservative settings for production stability.
     """
     # Base settings for all presets
     settings = {
@@ -69,7 +132,7 @@ def get_preset_settings(preset):
         'verbose': False  # Reduce console output
     }
     
-    # Preset-specific settings
+    # Preset-specific settings - conservative for stability
     presets = {
         'ultra_realtime': {
             'num_autoregressive_samples': 1, 
@@ -79,19 +142,19 @@ def get_preset_settings(preset):
         },
         'ultra_fast': {
             'num_autoregressive_samples': 1, 
-            'diffusion_iterations': 10
+            'diffusion_iterations': 8  # Reduced from 10
         },
         'fast': {
-            'num_autoregressive_samples': 32, 
-            'diffusion_iterations': 50
+            'num_autoregressive_samples': 16,  # Reduced from 32
+            'diffusion_iterations': 25  # Reduced from 50
         },
         'standard': {
-            'num_autoregressive_samples': 256, 
-            'diffusion_iterations': 200
+            'num_autoregressive_samples': 128,  # Reduced from 256
+            'diffusion_iterations': 100  # Reduced from 200
         },
         'high_quality': {
-            'num_autoregressive_samples': 256, 
-            'diffusion_iterations': 400
+            'num_autoregressive_samples': 128,  # Reduced from 256
+            'diffusion_iterations': 200  # Reduced from 400
         },
     }
     
@@ -140,16 +203,58 @@ def cuda_error_recovery():
             # Non-CUDA error, just re-raise
             raise e
 
+@contextmanager
+def cuda_error_recovery_no_http():
+    """
+    Context manager for CUDA error recovery that doesn't raise HTTPException.
+    Used inside streaming generators to avoid "response already started" errors.
+    """
+    global cuda_error_state
+    try:
+        yield
+    except Exception as e:
+        # Check if this is a CUDA-related error
+        error_str = str(e).lower()
+        if 'cuda' in error_str or 'gpu' in error_str or torch.cuda.is_available():
+            try:
+                # Attempt CUDA recovery
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                logger.info("CUDA recovery attempted (stream)")
+                # Mark the error but don't raise HTTPException
+                cuda_error_state["has_cuda_error"] = True
+                cuda_error_state["last_error_time"] = time.time()
+                cuda_error_state["error_count"] += 1
+                cuda_error_state["last_error_message"] = str(e)
+                logger.error(f"CUDA error in stream: {e}")
+            except Exception as recovery_error:
+                # Recovery failed - update error state
+                cuda_error_state["has_cuda_error"] = True
+                cuda_error_state["last_error_time"] = time.time()
+                cuda_error_state["error_count"] += 1
+                cuda_error_state["last_error_message"] = str(e)
+                logger.error(f"CUDA error (stream) and recovery failed: {recovery_error}")
+        # Swallow the exception to end stream gracefully
+        return
+
 @app.post("/synthesize")
 async def synthesize(payload: SynthesizePayload):
     try:
+        # Check VRAM headroom before starting
+        if not ensure_vram():
+            raise HTTPException(
+                status_code=503,
+                detail="Insufficient GPU memory. Please try again later."
+            )
+        
         # Record start time for performance measurement
         start_time = time.time()
         
         # Generate audio using the streaming TTS method which accepts diffusion parameters
         try:
             logger.info(f"Starting synthesis for voice '{payload.voice}' with text: '{payload.text[:50]}...'")
-            voice_samples = load_voice_samples(payload.voice)
+            voice_samples = _cached_voice_samples(payload.voice)
             if voice_samples:
                 logger.info(f"Loaded {len(voice_samples)} voice samples for '{payload.voice}'")
             else:
@@ -158,15 +263,22 @@ async def synthesize(payload: SynthesizePayload):
             logger.error(f"Voice loading failed: {e}")
             raise HTTPException(status_code=400, detail=str(e))
         
-        with cuda_error_recovery():
-            audio_generator = tts.tts_stream(
-                payload.text,
-                voice_samples=voice_samples,
-                **get_preset_settings(payload.preset)
-            )
-            
-            # Get the first (and only) audio chunk from the generator
-            pcm_audio = next(audio_generator)
+        # Validate voice samples before proceeding
+        if not voice_samples:
+            logger.error(f"No voice samples available for voice '{payload.voice}'")
+            raise HTTPException(status_code=400, detail=f"No voice samples available for voice '{payload.voice}'")
+        
+        # Serialize GPU access with semaphore
+        async with gpu_semaphore:
+            with cuda_error_recovery():
+                audio_generator = tts.tts_stream(
+                    payload.text,
+                    voice_samples=voice_samples,
+                    **get_preset_settings(payload.preset)
+                )
+                
+                # Get the first (and only) audio chunk from the generator
+                pcm_audio = next(audio_generator)
         
         # Record generation time
         generation_time = time.time() - start_time
@@ -225,45 +337,67 @@ async def synthesize_stream(payload: SynthesizePayload):
     Returns audio chunks as they are generated.
     """
     try:
+        # Check VRAM headroom before starting
+        if not ensure_vram():
+            raise HTTPException(
+                status_code=503,
+                detail="Insufficient GPU memory. Please try again later."
+            )
+        
         def generate_audio():
-            # Use the streaming TTS method which accepts diffusion parameters
+            """Generator function that safely handles CUDA errors without raising HTTPException."""
             try:
                 logger.info(f"Starting streaming synthesis for voice '{payload.voice}'")
-                voice_samples = load_voice_samples(payload.voice)
+                voice_samples = _cached_voice_samples(payload.voice)
                 if voice_samples:
                     logger.info(f"Loaded {len(voice_samples)} voice samples for streaming")
                 else:
-                    logger.info("Using random voice for streaming")
+                    logger.error(f"Voice loading failed for '{payload.voice}' - no voice samples loaded")
+                    logger.error("Streaming synthesis failed due to voice loading error")
+                    return
             except ValueError as e:
                 logger.error(f"Voice loading failed in streaming: {e}")
-                raise HTTPException(status_code=400, detail=str(e))
+                logger.error("Streaming synthesis failed due to voice loading error")
+                return
             
-            with cuda_error_recovery():
-                audio_generator = tts.tts_stream(
-                    payload.text,
-                    voice_samples=voice_samples,
-                    **get_preset_settings(payload.preset)
-                )
-                
-                for audio_chunk in audio_generator:
-                    if isinstance(audio_chunk, torch.Tensor):
-                        audio_data = audio_chunk.cpu().numpy()
-                    else:
-                        audio_data = audio_chunk
-                    
-                    # Handle multi-dimensional audio data
-                    if len(audio_data.shape) > 1:
-                        audio_data = audio_data[0] if audio_data.shape[0] == 1 else audio_data.flatten()
-                    
-                    # Normalize audio to 16-bit PCM range
-                    audio_data = np.clip(audio_data, -1.0, 1.0)
-                    audio_data = (audio_data * 32767).astype(np.int16)
-                    
-                    # Convert to WAV format
-                    bio = io.BytesIO()
-                    wavfile.write(bio, 24000, audio_data)
-                    bio.seek(0)
-                    yield bio.read()
+            # Validate voice samples before proceeding
+            if not voice_samples:
+                logger.error(f"No voice samples available for voice '{payload.voice}'")
+                return
+            
+            # Use threading lock for synchronous GPU access in generator
+            with gpu_lock:
+                with cuda_error_recovery_no_http():
+                    try:
+                        audio_generator = tts.tts_stream(
+                            payload.text,
+                            voice_samples=voice_samples,
+                            **get_preset_settings(payload.preset),
+                        )
+                        
+                        for audio_chunk in audio_generator:
+                            if isinstance(audio_chunk, torch.Tensor):
+                                audio_data = audio_chunk.cpu().numpy()
+                            else:
+                                audio_data = audio_chunk
+                            
+                            # Handle multi-dimensional audio data
+                            if len(audio_data.shape) > 1:
+                                audio_data = audio_data[0] if audio_data.shape[0] == 1 else audio_data.flatten()
+                            
+                            # Normalize audio to 16-bit PCM range
+                            audio_data = np.clip(audio_data, -1.0, 1.0)
+                            audio_data = (audio_data * 32767).astype(np.int16)
+                            
+                            # Convert to WAV format
+                            bio = io.BytesIO()
+                            wavfile.write(bio, 24000, audio_data)
+                            bio.seek(0)
+                            yield bio.read()
+                    except Exception as e:
+                        logger.exception(f"Streaming synthesis failed: {e}")
+                        # DO NOT raise; just stop the stream
+                        return
         
         return StreamingResponse(generate_audio(), media_type="audio/wav")
     except Exception as e:
@@ -276,11 +410,16 @@ async def health_check():
         "status": "healthy",
         "device": device,
         "platform": platform.system(),
+        "concurrency_control": {
+            "gpu_semaphore_limit": 1,
+            "gpu_lock_enabled": True
+        },
         "optimizations": {
             "use_deepspeed": use_deepspeed,
             "kv_cache": True,
             "half": True,
-            "autoregressive_batch_size": 16
+            "autoregressive_batch_size": 4,  # Conservative for stability
+            "voice_caching": True
         }
     }
 
@@ -343,6 +482,56 @@ async def list_voices():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/debug/clear-voice-cache")
+async def clear_voice_cache_endpoint():
+    """Clear the voice samples cache. Useful for debugging voice loading issues."""
+    try:
+        clear_voice_cache()
+        return {"message": "Voice cache cleared successfully"}
+    except Exception as e:
+        logger.error(f"Failed to clear voice cache: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/status/concurrency")
+async def concurrency_status():
+    """Monitor concurrency control status and GPU utilization."""
+    try:
+        status = {
+            "gpu_semaphore": {
+                "available": gpu_semaphore._value,
+                "total": 1,
+                "waiting": 0  # Would need to track this separately if needed
+            },
+            "gpu_lock": {
+                "locked": gpu_lock.locked(),
+                "owner": gpu_lock._owner if hasattr(gpu_lock, '_owner') else None
+            },
+            "vram_status": {
+                "available": ensure_vram(),
+                "min_required_gb": 1
+            }
+        }
+        
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            total = torch.cuda.get_device_properties(0).total_memory
+            reserved = torch.cuda.memory_reserved(0)
+            allocated = torch.cuda.memory_allocated(0)
+            free = total - reserved
+            
+            status["vram_status"].update({
+                "total_gb": round(total / 1e9, 2),
+                "reserved_gb": round(reserved / 1e9, 2),
+                "allocated_gb": round(allocated / 1e9, 2),
+                "free_gb": round(free / 1e9, 2),
+                "utilization_percent": round((reserved / total) * 100, 1)
+            })
+        
+        return status
+    except Exception as e:
+        logger.error(f"Error getting concurrency status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 def load_voice_samples(voice_name, max_retries=3):
     """
     Load voice samples for a given voice name with retry logic.
@@ -365,6 +554,10 @@ def load_voice_samples(voice_name, max_retries=3):
     audio_files = [f for f in os.listdir(voice_dir) if f.endswith(('.wav', '.mp3', '.flac'))]
     logger.info(f"Found {len(audio_files)} audio files: {audio_files}")
     
+    # Also check for .pth files (pre-computed conditioning latents)
+    pth_files = [f for f in os.listdir(voice_dir) if f.endswith('.pth')]
+    logger.info(f"Found {len(pth_files)} .pth files: {pth_files}")
+    
     voice_samples = []
     failed_files = []
     
@@ -377,6 +570,7 @@ def load_voice_samples(voice_name, max_retries=3):
             try:
                 logger.info(f"Loading {file} (attempt {attempt + 1}/{max_retries})")
                 audio = load_audio(file_path, 22050)  # 22050 Hz for voice samples
+                logger.info(f"Loaded {file}: shape={audio.shape}, dtype={audio.dtype}, device={audio.device if hasattr(audio, 'device') else 'unknown'}")
                 voice_samples.append(audio)
                 logger.info(f"Successfully loaded {file}")
                 loaded = True
@@ -406,4 +600,30 @@ def load_voice_samples(voice_name, max_retries=3):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    # Operational hardening recommendations
+    print("🚀 Production-ready Tortoise TTS API starting...")
+    print("📋 Key operational settings:")
+    print(f"   • GPU concurrency: Serialized (semaphore limit: 1)")
+    print(f"   • Autoregressive batch size: 4 (conservative)")
+    print(f"   • Voice caching: Enabled (max 64 voices)")
+    print(f"   • VRAM guard: 1GB minimum free")
+    print(f"   • DeepSpeed: {'Enabled' if use_deepspeed else 'Disabled'}")
+    print("")
+    print("💡 Production deployment tips:")
+    print("   • Use --workers 1 with uvicorn (one worker per GPU)")
+    print("   • Set CUDA_LAUNCH_BLOCKING=1 in staging for debugging")
+    print("   • Enable GPU persistence mode: nvidia-smi -pm 1")
+    print("   • Monitor /status/concurrency for GPU utilization")
+    print("   • Use /health/cuda for automated restart detection")
+    print("")
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        # Production recommendations:
+        # workers=1,  # Uncomment for production - one worker per GPU
+        # access_log=True,  # Enable access logging
+        # log_level="info"
+    )

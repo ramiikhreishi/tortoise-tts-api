@@ -39,6 +39,8 @@ RUN pip install -e .
 RUN pip install -r requirements_api.txt
 
 
+ENV LOG_DIR=/app/logs
+
 EXPOSE 8000
 
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
