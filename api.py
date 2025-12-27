@@ -369,6 +369,7 @@ async def synthesize_stream(payload: SynthesizePayload):
             with gpu_lock:
                 with cuda_error_recovery_no_http():
                     try:
+                        logger.info(f"text: {payload.text}")
                         audio_generator = tts.tts_stream(
                             payload.text,
                             voice_samples=voice_samples,
