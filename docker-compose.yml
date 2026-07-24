@@ -10,11 +10,14 @@ services:
     environment:
       - TORTOISE_MODELS_DIR=/models
     volumes:
-      - /mnt/user/data/tortoise_tts/models:/models
-      - /mnt/user/data/tortoise_tts/results:/results
-      - /mnt/user/data/.cache/huggingface:/root/.cache/huggingface
-      - /mnt/user/data/tortoise_tts/logs:/app/logs
-      - /root:/work
+      - tortoise-models:/models
+      - tortoise-results:/results
+      - tortoise-hf-cache:/root/.cache/huggingface
+      - tortoise-logs:/app/logs
+      # use_deepspeed=True on Linux JIT-compiles CUDA kernels via nvcc/ninja on
+      # first use (10-20+ min). Persist the compiled extensions so this only
+      # ever happens once instead of on every container restart.
+      - tortoise-torch-extensions:/root/.cache/torch_extensions
     deploy:
       resources:
         reservations:
@@ -28,7 +31,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      # Generous to survive the one-time DeepSpeed JIT compile on first boot —
+      # autoheal would otherwise kill and restart the container mid-compile.
+      start_period: 1200s
     labels:
       - autoheal=true
   autoheal:
@@ -42,3 +47,10 @@ services:
       # - AUTOHEAL_CONTAINER_LABEL=all
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+
+volumes:
+  tortoise-models:
+  tortoise-results:
+  tortoise-hf-cache:
+  tortoise-logs:
+  tortoise-torch-extensions:

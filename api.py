@@ -109,23 +109,51 @@ def ensure_vram(min_free_bytes=1_000_000_000):  # ~1 GB
         return free >= min_free_bytes
     return True
 
+# Tortoise is stochastic in TWO ways that make the same voice drift between
+# separate calls (i.e. sentence to sentence in one phone call):
+#   1. format_conditioning() picks a RANDOM window of each reference clip to
+#      build the voice conditioning from — a different slice each call means a
+#      different pitch/timbre realization of the speaker.
+#   2. the autoregressive sampler is seeded from int(time()) per call.
+# deterministic_state() seeds both torch AND python's `random`, and runs before
+# the reference clip is sliced — so pinning a single fixed seed makes BOTH the
+# conditioning slice and the sampling trajectory identical every call, locking
+# the voice to one consistent speaker realization. This is the fix for "the
+# voice changes between sentences / sometimes sounds like a different person".
+DEFAULT_VOICE_SEED = 777
+
+
 class SynthesizePayload(BaseModel):
     text: str
     voice: str = "random"
     preset: str = "ultra_realtime"  # Default to ultra_realtime for <500ms target
+    # Fixed by default for voice consistency; can be overridden per-request.
+    seed: int = DEFAULT_VOICE_SEED
 
 def get_preset_settings(preset):
     """
     Returns the settings for a given preset, compatible with tts_stream method.
     Conservative settings for production stability.
     """
-    # Base settings for all presets
+    # Base settings for all presets.
+    # The streaming path samples ONE autoregressive take per sentence (no
+    # best-of-N selection), so temperature/top_p directly drive how much the
+    # voice's tone/clarity/energy wanders between sentences.
+    # diffusion_temperature was dropped to 0.85 for a flatter delivery, but
+    # Tortoise's own docs are explicit that low diffusion_temperature makes
+    # output "smeared" — confirmed in practice as a hollow, "ghost voice" quality
+    # on short exclamatory lines ("Great, hi Tom!"). Reverted to 1.0 (its
+    # documented safe default); this parameter isn't where the "flatter" energy
+    # controls should have come from anyway. temperature/top_p (which do control
+    # tone/energy safely) stay pulled back from the pre-tuning defaults for the
+    # calmer delivery, but eased up slightly from the most extreme cut (0.2/0.6)
+    # to leave a safety margin from this kind of artifact.
     settings = {
-        'temperature': 0.8, 
-        'length_penalty': 1.0, 
+        'temperature': 0.28,
+        'length_penalty': 1.0,
         'repetition_penalty': 2.0,
-        'top_p': 0.8,
-        'cond_free_k': 2.0, 
+        'top_p': 0.65,
+        'cond_free_k': 2.0,
         'diffusion_temperature': 1.0,
         'cond_free': True,
         'k': 1,
@@ -274,9 +302,10 @@ async def synthesize(payload: SynthesizePayload):
                 audio_generator = tts.tts_stream(
                     payload.text,
                     voice_samples=voice_samples,
+                    use_deterministic_seed=payload.seed,
                     **get_preset_settings(payload.preset)
                 )
-                
+
                 # Get the first (and only) audio chunk from the generator
                 pcm_audio = next(audio_generator)
         
@@ -373,6 +402,7 @@ async def synthesize_stream(payload: SynthesizePayload):
                         audio_generator = tts.tts_stream(
                             payload.text,
                             voice_samples=voice_samples,
+                            use_deterministic_seed=payload.seed,
                             **get_preset_settings(payload.preset),
                         )
                         

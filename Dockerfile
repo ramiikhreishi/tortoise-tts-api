@@ -19,8 +19,9 @@ RUN apt-get update && \
     libaio-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Install pip for Python 3.9
-RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.9
+# Install pip for Python 3.9 — the generic get-pip.py bootstrap dropped support
+# for EOL Python versions, so use the version-pinned one for 3.9 specifically.
+RUN curl -sS https://bootstrap.pypa.io/pip/3.9/get-pip.py | python3.9
 
 # Set python and pip aliases
 RUN ln -s /usr/bin/python3.9 /usr/bin/python && ln -s /usr/local/bin/pip /usr/bin/pip
